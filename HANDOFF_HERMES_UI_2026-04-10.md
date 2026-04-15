@@ -250,8 +250,8 @@ These are real values observed on this machine during this session:
 
 ### QA credentials
 
-- Email: `qa@example.com`
-- Password: `Passw0rd!123`
+- Email: `<redacted-email>`
+- Password: `<redacted-password>`
 
 ### Hermes runtime on this machine
 
