@@ -42,8 +42,8 @@ This is still **not done**. The project is in the "middle-plus / approaching fin
 
 ### Local QA Credentials
 
-- Email: `qa@example.com`
-- Password: `Passw0rd!123`
+- Email: `<redacted-email>`
+- Password: `<redacted-password>`
 
 ### Notes
 
@@ -360,8 +360,8 @@ These are the next safest bounded slices consistent with AGENTS.md:
    - `http://127.0.0.1:8080/c/b62bb0d2-70e9-44ee-aee9-d3537c5d9713`
 
 3. Log in with:
-   - `qa@example.com`
-   - `Passw0rd!123`
+   - `<redacted-email>`
+   - `<redacted-password>`
 
 4. Verify in UI:
    - topbar quick-entry cluster exists
