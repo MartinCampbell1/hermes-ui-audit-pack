@@ -1,0 +1,8 @@
+snapshot/hermes-home/auth.json -> /Users/martin/.hermes/auth.json
+snapshot/hermes-home/config.yaml -> /Users/martin/.hermes/config.yaml
+patches/base_ref.txt
+patches/series
+patches/001-auth-runtime.patch
+patches/002-cli-dashboard.patch
+patches/003-pool-runtime.patch
+patches/004-thread-sessions.patch

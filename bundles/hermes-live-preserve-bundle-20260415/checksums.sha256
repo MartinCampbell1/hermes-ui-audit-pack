@@ -1,0 +1,8 @@
+4eaa771d2d3d221dafaf0fe599fc839bfe046df6fbcb56b687a90be4db0cd3ab  ./patches/base_ref.txt
+3080c52f07f173c2e299d7e27f4741044fdb86ed6ff4021f1323f5b512d14700  ./patches/series
+bd7e67078ea075acd558a2838703fb3bdc08da7e6710bc66397325a0f0e8acb6  ./snapshot/hermes-home/auth.json
+8c518053d23cd06c742450434027a3e986adaae84d5d1a4ceb67bda0385c1c31  ./snapshot/hermes-home/config.yaml
+fe0856f0fc36979fcdd13e3a930c4204bed0fb4135764321989c2a860f579447  ./patches/001-auth-runtime.patch
+f73cb3913d2b686ea2ee3f6e45fa45548d6c2ccc37b504c7ed1de5795644b664  ./patches/002-cli-dashboard.patch
+ab0dea91f130ee1759a3978df1df1f21cbd4194f802ba957f2a976e0331410a9  ./patches/003-pool-runtime.patch
+20688fbbb1e80af526c8ed65d5dba8f49eb341345d325cc6d9113a11ded14566  ./patches/004-thread-sessions.patch

@@ -1,0 +1,514 @@
+diff --git a/hermes_state.py b/hermes_state.py
+index 5e563666..b08a49b1 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -31,7 +31,7 @@ T = TypeVar("T")
+ 
+ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+ 
+-SCHEMA_VERSION = 6
++SCHEMA_VERSION = 7
+ 
+ SCHEMA_SQL = """
+ CREATE TABLE IF NOT EXISTS schema_version (
+@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS sessions (
+     cost_source TEXT,
+     pricing_version TEXT,
+     title TEXT,
++    thread_id TEXT,
++    session_kind TEXT,
++    is_user_visible INTEGER DEFAULT 1,
+     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+ );
+ 
+@@ -134,6 +137,7 @@ class SessionDB:
+     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+     # Attempt a PASSIVE WAL checkpoint every N successful writes.
+     _CHECKPOINT_EVERY_N_WRITES = 50
++    _USER_VISIBLE_KINDS = {"root", "branch", "compression"}
+ 
+     def __init__(self, db_path: Path = None):
+         self.db_path = db_path or DEFAULT_DB_PATH
+@@ -329,6 +333,32 @@ class SessionDB:
+                     except sqlite3.OperationalError:
+                         pass  # Column already exists
+                 cursor.execute("UPDATE schema_version SET version = 6")
++            if current_version < 7:
++                for col_name, col_type in [
++                    ("thread_id", "TEXT"),
++                    ("session_kind", "TEXT"),
++                    ("is_user_visible", "INTEGER DEFAULT 1"),
++                ]:
++                    try:
++                        safe = col_name.replace('"', '""')
++                        cursor.execute(
++                            f'ALTER TABLE sessions ADD COLUMN "{safe}" {col_type}'
++                        )
++                    except sqlite3.OperationalError:
++                        pass
++                try:
++                    cursor.execute(
++                        "CREATE INDEX IF NOT EXISTS idx_sessions_thread ON sessions(thread_id)"
++                    )
++                except sqlite3.OperationalError:
++                    pass
++                try:
++                    cursor.execute(
++                        "CREATE INDEX IF NOT EXISTS idx_sessions_visible ON sessions(is_user_visible)"
++                    )
++                except sqlite3.OperationalError:
++                    pass
++                cursor.execute("UPDATE schema_version SET version = 7")
+ 
+         # Unique title index — always ensure it exists (safe to run after migrations
+         # since the title column is guaranteed to exist at this point)
+@@ -339,6 +369,15 @@ class SessionDB:
+             )
+         except sqlite3.OperationalError:
+             pass  # Index already exists
++        try:
++            cursor.execute(
++                "CREATE INDEX IF NOT EXISTS idx_sessions_thread ON sessions(thread_id)"
++            )
++            cursor.execute(
++                "CREATE INDEX IF NOT EXISTS idx_sessions_visible ON sessions(is_user_visible)"
++            )
++        except sqlite3.OperationalError:
++            pass
+ 
+         # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
+         try:
+@@ -347,6 +386,123 @@ class SessionDB:
+             cursor.executescript(FTS_SQL)
+ 
+         self._conn.commit()
++        self._backfill_thread_metadata()
++
++    def _column_exists(self, table: str, column: str) -> bool:
++        with self._lock:
++            cursor = self._conn.execute(f"PRAGMA table_info({table})")
++            return any(row["name"] == column for row in cursor.fetchall())
++
++    @staticmethod
++    def _is_user_visible_kind(kind: str) -> int:
++        return 1 if str(kind or "").strip() in SessionDB._USER_VISIBLE_KINDS else 0
++
++    @staticmethod
++    def _infer_session_kind(row: Dict[str, Any], parent: Optional[Dict[str, Any]]) -> str:
++        parent_id = row.get("parent_session_id")
++        if not parent_id:
++            return "root"
++
++        title = str(row.get("title") or "").strip()
++        parent_title = str((parent or {}).get("title") or "").strip()
++        message_count = int(row.get("message_count") or 0)
++        parent_end_reason = str((parent or {}).get("end_reason") or "").strip()
++
++        if title and re.search(r" #\d+$", title):
++            if not parent_title or title.startswith(parent_title + " #"):
++                return "compression"
++            return "branch"
++
++        if parent_end_reason == "compression":
++            return "compression" if message_count >= 10 else "internal"
++
++        if str(row.get("source") or "").strip() == "tool":
++            return "tool"
++
++        if message_count <= 2 and not title:
++            return "subagent"
++
++        return "subagent"
++
++    def _backfill_thread_metadata(self) -> None:
++        if not all(
++            self._column_exists("sessions", column)
++            for column in ("thread_id", "session_kind", "is_user_visible")
++        ):
++            return
++
++        with self._lock:
++            cursor = self._conn.execute(
++                """
++                SELECT id, parent_session_id, title, source, end_reason, message_count,
++                       thread_id, session_kind, is_user_visible, started_at
++                FROM sessions
++                ORDER BY started_at ASC
++                """
++            )
++            rows = [dict(row) for row in cursor.fetchall()]
++            if not rows:
++                return
++
++            by_id = {row["id"]: row for row in rows}
++            resolved_thread_ids: Dict[str, str] = {}
++
++            def _resolve_thread_id(session_id: str) -> str:
++                if session_id in resolved_thread_ids:
++                    return resolved_thread_ids[session_id]
++                row = by_id.get(session_id)
++                if not row:
++                    resolved_thread_ids[session_id] = session_id
++                    return session_id
++                existing = str(row.get("thread_id") or "").strip()
++                if existing:
++                    resolved_thread_ids[session_id] = existing
++                    return existing
++                parent_id = row.get("parent_session_id")
++                if not parent_id:
++                    resolved_thread_ids[session_id] = session_id
++                    return session_id
++                resolved = _resolve_thread_id(parent_id)
++                resolved_thread_ids[session_id] = resolved
++                return resolved
++
++            updates: list[tuple[str, str, int, str]] = []
++            for row in rows:
++                thread_id = _resolve_thread_id(row["id"])
++                parent = by_id.get(row.get("parent_session_id") or "")
++                existing_kind = str(row.get("session_kind") or "").strip()
++                session_kind = existing_kind or self._infer_session_kind(row, parent)
++                # Visibility is an invariant derived from session_kind. Keep it
++                # aligned even for rows that were already backfilled once with a
++                # stale default value from an earlier migration attempt.
++                is_user_visible = self._is_user_visible_kind(session_kind)
++                if (
++                    str(row.get("thread_id") or "").strip() != thread_id
++                    or str(row.get("session_kind") or "").strip() != session_kind
++                    or row.get("is_user_visible") != is_user_visible
++                ):
++                    updates.append((thread_id, session_kind, is_user_visible, row["id"]))
++
++            if not updates:
++                return
++
++            self._conn.execute("BEGIN IMMEDIATE")
++            try:
++                self._conn.executemany(
++                    """
++                    UPDATE sessions
++                    SET thread_id = ?, session_kind = ?, is_user_visible = ?
++                    WHERE id = ?
++                    """,
++                    updates,
++                )
++                self._conn.commit()
++            except BaseException:
++                try:
++                    self._conn.rollback()
++                except Exception:
++                    pass
++                raise
+ 
+     # =========================================================================
+     # Session lifecycle
+@@ -361,13 +517,37 @@ class SessionDB:
+         system_prompt: str = None,
+         user_id: str = None,
+         parent_session_id: str = None,
++        thread_id: str = None,
++        session_kind: str = None,
++        is_user_visible: Optional[bool] = None,
+     ) -> str:
+         """Create a new session record. Returns the session_id."""
+         def _do(conn):
++            resolved_thread_id = str(thread_id or "").strip()
++            if not resolved_thread_id:
++                if parent_session_id:
++                    parent = conn.execute(
++                        "SELECT thread_id FROM sessions WHERE id = ?",
++                        (parent_session_id,),
++                    ).fetchone()
++                    resolved_thread_id = (
++                        str(parent["thread_id"] or "").strip()
++                        if parent and parent["thread_id"]
++                        else str(parent_session_id)
++                    )
++                else:
++                    resolved_thread_id = session_id
++            resolved_kind = str(session_kind or "").strip() or ("subagent" if parent_session_id else "root")
++            resolved_visible = (
++                int(bool(is_user_visible))
++                if is_user_visible is not None
++                else self._is_user_visible_kind(resolved_kind)
++            )
+             conn.execute(
+                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
+-                   system_prompt, parent_session_id, started_at)
+-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
++                   system_prompt, parent_session_id, started_at, thread_id, session_kind,
++                   is_user_visible)
++                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (
+                     session_id,
+                     source,
+@@ -377,6 +557,9 @@ class SessionDB:
+                     system_prompt,
+                     parent_session_id,
+                     time.time(),
++                    resolved_thread_id,
++                    resolved_kind,
++                    resolved_visible,
+                 ),
+             )
+         self._execute_write(_do)
+@@ -514,9 +697,9 @@ class SessionDB:
+         def _do(conn):
+             conn.execute(
+                 """INSERT OR IGNORE INTO sessions
+-                   (id, source, model, started_at)
+-                   VALUES (?, ?, ?, ?)""",
+-                (session_id, source, model, time.time()),
++                   (id, source, model, started_at, thread_id, session_kind, is_user_visible)
++                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
++                (session_id, source, model, time.time(), session_id, "root", 1),
+             )
+         self._execute_write(_do)
+ 
+@@ -784,6 +967,93 @@ class SessionDB:
+ 
+         return sessions
+ 
++    def list_threads_rich(
++        self,
++        source: str = None,
++        exclude_sources: List[str] = None,
++        limit: int = 20,
++        offset: int = 0,
++    ) -> List[Dict[str, Any]]:
++        """List user-visible conversation threads.
++
++        A thread groups root sessions with user-visible continuations
++        (compression/branch leaves) and returns the latest visible leaf per
++        thread as the canonical session for UI/display purposes.
++        """
++        where_clauses = ["COALESCE(s.is_user_visible, 1) = 1"]
++        params: list[Any] = []
++        if source:
++            where_clauses.append("s.source = ?")
++            params.append(source)
++        if exclude_sources:
++            placeholders = ",".join("?" for _ in exclude_sources)
++            where_clauses.append(f"s.source NOT IN ({placeholders})")
++            params.extend(exclude_sources)
++
++        query = f"""
++            SELECT s.*,
++                COALESCE(s.thread_id, s.id) AS resolved_thread_id,
++                COALESCE(
++                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
++                     FROM messages m
++                     WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
++                     ORDER BY m.timestamp, m.id LIMIT 1),
++                    ''
++                ) AS _preview_raw,
++                COALESCE(
++                    (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
++                    s.started_at
++                ) AS last_active
++            FROM sessions s
++            WHERE {" AND ".join(where_clauses)}
++            ORDER BY last_active DESC, s.started_at DESC
++        """
++        with self._lock:
++            cursor = self._conn.execute(query, params)
++            rows = [dict(row) for row in cursor.fetchall()]
++
++        grouped: Dict[str, Dict[str, Any]] = {}
++        for row in rows:
++            thread_key = str(row.get("resolved_thread_id") or row.get("id") or "")
++            if not thread_key or thread_key in grouped:
++                continue
++            raw = str(row.pop("_preview_raw", "") or "").strip()
++            row["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
++            row["thread_id"] = thread_key
++            row["root_session_id"] = thread_key
++            grouped[thread_key] = row
++
++        threads = list(grouped.values())
++        threads.sort(
++            key=lambda item: (
++                float(item.get("last_active") or item.get("started_at") or 0),
++                float(item.get("started_at") or 0),
++            ),
++            reverse=True,
++        )
++        return threads[offset: offset + limit]
++
++    def export_real_sessions(
++        self,
++        source: str = None,
++        exclude_sources: List[str] = None,
++    ) -> List[Dict[str, Any]]:
++        """Export canonical user-visible threads for external UI consumers."""
++        threads = self.list_threads_rich(
++            source=source,
++            exclude_sources=exclude_sources,
++            limit=100000,
++            offset=0,
++        )
++        results: List[Dict[str, Any]] = []
++        for thread in threads:
++            canonical_session_id = str(thread.get("id") or "")
++            if not canonical_session_id:
++                continue
++            messages = self.get_messages(canonical_session_id)
++            results.append({**thread, "messages": messages})
++        return results
++
+     # =========================================================================
+     # Message storage
+     # =========================================================================
+diff --git a/tools/session_search_tool.py b/tools/session_search_tool.py
+index 9be73a04..87879b8b 100644
+--- a/tools/session_search_tool.py
++++ b/tools/session_search_tool.py
+@@ -19,7 +19,6 @@ import asyncio
+ import concurrent.futures
+ import json
+ import logging
+-import re
+ from typing import Dict, Any, List, Optional, Union
+ 
+ from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+@@ -91,80 +90,31 @@ def _truncate_around_matches(
+     full_text: str, query: str, max_chars: int = MAX_SESSION_CHARS
+ ) -> str:
+     """
+-    Truncate a conversation transcript to *max_chars*, choosing a window
+-    that maximises coverage of positions where the *query* actually appears.
+-
+-    Strategy (in priority order):
+-    1. Try to find the full query as a phrase (case-insensitive).
+-    2. If no phrase hit, look for positions where all query terms appear
+-       within a 200-char proximity window (co-occurrence).
+-    3. Fall back to individual term positions.
+-
+-    Once candidate positions are collected the function picks the window
+-    start that covers the most of them.
++    Truncate a conversation transcript to max_chars, centered around
++    where the query terms appear. Keeps content near matches, trims the edges.
+     """
+     if len(full_text) <= max_chars:
+         return full_text
+ 
++    # Find the first occurrence of any query term
++    query_terms = query.lower().split()
+     text_lower = full_text.lower()
+-    query_lower = query.lower().strip()
+-    match_positions: list[int] = []
+-
+-    # --- 1. Full-phrase search ------------------------------------------------
+-    phrase_pat = re.compile(re.escape(query_lower))
+-    match_positions = [m.start() for m in phrase_pat.finditer(text_lower)]
+-
+-    # --- 2. Proximity co-occurrence of all terms (within 200 chars) -----------
+-    if not match_positions:
+-        terms = query_lower.split()
+-        if len(terms) > 1:
+-            # Collect every occurrence of each term
+-            term_positions: dict[str, list[int]] = {}
+-            for t in terms:
+-                term_positions[t] = [
+-                    m.start() for m in re.finditer(re.escape(t), text_lower)
+-                ]
+-            # Slide through positions of the rarest term and check proximity
+-            rarest = min(terms, key=lambda t: len(term_positions.get(t, [])))
+-            for pos in term_positions.get(rarest, []):
+-                if all(
+-                    any(abs(p - pos) < 200 for p in term_positions.get(t, []))
+-                    for t in terms
+-                    if t != rarest
+-                ):
+-                    match_positions.append(pos)
+-
+-    # --- 3. Individual term positions (last resort) ---------------------------
+-    if not match_positions:
+-        terms = query_lower.split()
+-        for t in terms:
+-            for m in re.finditer(re.escape(t), text_lower):
+-                match_positions.append(m.start())
+-
+-    if not match_positions:
+-        # Nothing at all — take from the start
+-        truncated = full_text[:max_chars]
+-        suffix = "\n\n...[later conversation truncated]..." if max_chars < len(full_text) else ""
+-        return truncated + suffix
+-
+-    # --- Pick window that covers the most match positions ---------------------
+-    match_positions.sort()
+-
+-    best_start = 0
+-    best_count = 0
+-    for candidate in match_positions:
+-        ws = max(0, candidate - max_chars // 4)  # bias: 25% before, 75% after
+-        we = ws + max_chars
+-        if we > len(full_text):
+-            ws = max(0, len(full_text) - max_chars)
+-            we = len(full_text)
+-        count = sum(1 for p in match_positions if ws <= p < we)
+-        if count > best_count:
+-            best_count = count
+-            best_start = ws
+-
+-    start = best_start
++    first_match = len(full_text)
++    for term in query_terms:
++        pos = text_lower.find(term)
++        if pos != -1 and pos < first_match:
++            first_match = pos
++
++    if first_match == len(full_text):
++        # No match found, take from the start
++        first_match = 0
++
++    # Center the window around the first match
++    half = max_chars // 2
++    start = max(0, first_match - half)
+     end = min(len(full_text), start + max_chars)
++    if end - start < max_chars:
++        start = max(0, end - max_chars)
+ 
+     truncated = full_text[start:end]
+     prefix = "...[earlier conversation truncated]...\n\n" if start > 0 else ""
+@@ -245,7 +195,7 @@ _HIDDEN_SESSION_SOURCES = ("tool",)
+ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+     """Return metadata for the most recent sessions (no LLM calls)."""
+     try:
+-        sessions = db.list_sessions_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
++        sessions = db.list_threads_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
+ 
+         # Resolve current session lineage to exclude it
+         current_root = None
+@@ -253,22 +203,26 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
+             try:
+                 sid = current_session_id
+                 visited = set()
++                root_sid = current_session_id
+                 while sid and sid not in visited:
+                     visited.add(sid)
+                     s = db.get_session(sid)
+                     parent = s.get("parent_session_id") if s else None
++                    if not parent:
++                        root_sid = sid
+                     sid = parent if parent else None
+-                current_root = max(visited, key=len) if visited else current_session_id
++                current_root = root_sid
+             except Exception:
+                 current_root = current_session_id
+ 
+         results = []
+         for s in sessions:
+             sid = s.get("id", "")
+-            if current_root and (sid == current_root or sid == current_session_id):
+-                continue
+-            # Skip child/delegation sessions (they have parent_session_id)
+-            if s.get("parent_session_id"):
++            if current_root and (
++                sid == current_root
++                or sid == current_session_id
++                or s.get("thread_id") == current_root
++            ):
+                 continue
+             results.append({
+                 "session_id": sid,
